@@ -1,8 +1,11 @@
 /*
-  OPTIMIZED ESP32 DOME CONTROLLER (REV 27 - Pure TCP / No Discovery)
+  OPTIMIZED ESP32 DOME CONTROLLER (REV 28 - Sensor-mode compile flag)
   - REMOVED: AsyncUDP (Discovery) to free resources and prevent stack conflicts.
   - OPTIMIZATION: Pure TCP focus for maximum polling speed.
   - CONFIG: Requires manual IP entry in NINA (Discovery disabled).
+  - REV 28: Added SENSOR_TYPE compile flag to support either the original
+           magnetic reed sensors or IR obstacle sensors. See "SENSOR MODE
+           REFERENCE" below the config block for wiring and semantics.
 */
  
 #include <WiFi.h>
@@ -23,11 +26,68 @@ const char* password = "PASSWORD";
 #define WIFI_CHECK_INTERVAL     30000UL
 #define WIFI_RETRY_INTERVAL     5000UL
  
-// ========= PIN DEFINITIONS =========
-#define RELAY_PIN       26
-#define ROOF_OPEN_PIN   33
-#define ROOF_CLOSED_PIN 32
-#define PARK_SAFE_PIN   27
+// ========= HARDWARE CONFIG =========
+// --- Pin assignments ---
+#define RELAY_PIN       26   // Motor-control relay. Single pulse toggles direction at the driver.
+#define ROOF_OPEN_PIN   33   // Magnetic: open-limit reed.  IR: either of the two IR sensors.
+#define ROOF_CLOSED_PIN 32   // Magnetic: closed-limit reed. IR: the other IR sensor.
+#define PARK_SAFE_PIN   27   // Park-safe input (scope parked / safe to move roof).
+
+// --- Sensor technology ---
+// Pick one. See "SENSOR MODE REFERENCE" below for wiring, placement and logic.
+#define SENSOR_MAGNETIC_REED 0   // Two NC reed switches + magnets on the roof (original).
+#define SENSOR_IR_BEAM       1   // Two NO IR sensors looking up at the roof underside.
+#define SENSOR_TYPE          SENSOR_MAGNETIC_REED
+
+// Logic level read when a sensor reports "triggered".
+//   Reed NC with INPUT_PULLUP:                    LOW
+//   Typical 5V IR obstacle module (OC / pulled):  LOW
+//   Active-high push-pull IR module (rare):       HIGH
+#define SENSOR_ACTIVE_LEVEL  LOW
+
+// ============================================================================
+// SENSOR MODE REFERENCE
+// ============================================================================
+// SENSOR_MAGNETIC_REED (original behaviour)
+// ------------------------------------------
+//   Two NC reed switches are fixed to the wall. Two magnets ride on the roof.
+//     * One magnet lands over the CLOSED reed when the roof is fully shut.
+//     * The other magnet lands over the OPEN reed at the open-stop position
+//       (typically ~75 % travel, chosen to expose the pier only).
+//   Only one reed is triggered at a time:
+//       CLOSED_PIN active, OPEN_PIN inactive  -> CLOSED
+//       OPEN_PIN   active, CLOSED_PIN inactive -> OPEN
+//       neither active (while slewing)        -> transit; >60 s -> ERROR
+//   Caveats:
+//     * ~5 mm placement tolerance. Roof drift of ~1 cm makes the reed miss the
+//       magnet, the driver reports "lost" and NINA sequences abort.
+//     * Cannot be used to detect a roof that fully overshoots the open-stop
+//       (e.g. to expose pier AND roof eaves): both reeds read inactive, which
+//       is indistinguishable from the lost state.
+//
+// SENSOR_IR_BEAM
+// --------------
+//   Two NO IR obstacle/reflection modules are mounted on the wall, looking up
+//   at the roof underside. The roof itself is the target - no magnets needed.
+//   Place them so that:
+//     * both sensors sit under the roof when it is fully CLOSED, and
+//     * both sensors are clear of the roof at the desired fully-OPEN position.
+//   Logic (deliberately trivial, matches the "Planned" diagram):
+//       both triggered   -> CLOSED
+//       both UNtriggered -> OPEN
+//       exactly one      -> in transit (counts toward the 60 s lost timer)
+//   Why this mode exists:
+//     * Tolerates ~1-2 cm of roof drift - the beam hits the roof anywhere over
+//       a wide footprint, so minor misalignment no longer drops the signal.
+//     * Supports roofs that fully overshoot the opening. "Both inactive" is
+//       now an explicit OPEN state instead of an ambiguous lost state.
+//   Notes:
+//     * SENSOR_ACTIVE_LEVEL is LOW for most cheap 5V IR modules. Verify yours
+//       with a multimeter: output goes toward 0 V when an obstacle is near.
+//     * Shield the IR receiver from direct sunlight on the sensor face.
+//     * In this mode the two sensors are symmetric - either physical sensor
+//       may be wired to either pin.
+// ============================================================================
  
 // ========= STATE =========
 enum ShutterState {
@@ -67,15 +127,38 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
 <button>Save & Reboot</button></form></body></html>
 )rawliteral";
  
+// ========= SENSOR HELPERS =========
+static inline bool sensorTriggered(int pin) {
+  return digitalRead(pin) == SENSOR_ACTIVE_LEVEL;
+}
+
+// Logical roof position. Abstracts the physical sensor layout so the rest of
+// the file treats both sensor modes identically.
+bool isRoofAtClosed() {
+#if SENSOR_TYPE == SENSOR_IR_BEAM
+  return sensorTriggered(ROOF_CLOSED_PIN) && sensorTriggered(ROOF_OPEN_PIN);
+#else
+  return sensorTriggered(ROOF_CLOSED_PIN);
+#endif
+}
+
+bool isRoofAtOpen() {
+#if SENSOR_TYPE == SENSOR_IR_BEAM
+  return !sensorTriggered(ROOF_CLOSED_PIN) && !sensorTriggered(ROOF_OPEN_PIN);
+#else
+  return sensorTriggered(ROOF_OPEN_PIN);
+#endif
+}
+
 // ========= UTILS =========
 const char* domeStatusStr() {
   if (roofLost) return "ERROR";
-  if (digitalRead(ROOF_OPEN_PIN) == LOW)   return "OPEN";
-  if (digitalRead(ROOF_CLOSED_PIN) == LOW) return "CLOSED";
+  if (isRoofAtOpen())   return "OPEN";
+  if (isRoofAtClosed()) return "CLOSED";
   if (isSlewing) return (currentShutterState == SHUTTER_OPENING) ? "OPENING" : "CLOSING";
   return "CLOSED";
 }
- 
+
 bool isSystemSafe() { return (digitalRead(PARK_SAFE_PIN) == LOW); }
  
 void triggerRelay() {
@@ -89,24 +172,24 @@ void triggerRelay() {
 // ========= STATE LOGIC =========
 void roofOpen(bool enforceSafety) {
   if (enforceSafety && !isSystemSafe()) return;
-  if (digitalRead(ROOF_OPEN_PIN) == LOW) return;
+  if (isRoofAtOpen()) return;
   triggerRelay();
   currentShutterState = SHUTTER_OPENING;
   isSlewing = true; lastCommandTime = millis();
 }
- 
+
 void roofClose(bool enforceSafety) {
   if (enforceSafety && !isSystemSafe()) return;
-  if (digitalRead(ROOF_CLOSED_PIN) == LOW) return;
+  if (isRoofAtClosed()) return;
   triggerRelay();
   currentShutterState = SHUTTER_CLOSING;
   isSlewing = true; lastCommandTime = millis();
 }
- 
+
 void updateRoofState() {
   if (relayActive && millis() > relayOffTime) { digitalWrite(RELAY_PIN, LOW); relayActive = false; }
-  bool ro = (digitalRead(ROOF_OPEN_PIN) == LOW);
-  bool rc = (digitalRead(ROOF_CLOSED_PIN) == LOW);
+  bool ro = isRoofAtOpen();
+  bool rc = isRoofAtClosed();
   if (isSlewing) {
     if (currentShutterState == SHUTTER_OPENING && ro) { currentShutterState=SHUTTER_OPEN; isSlewing=false; roofLost=false; }
     if (currentShutterState == SHUTTER_CLOSING && rc) { currentShutterState=SHUTTER_CLOSED; isSlewing=false; roofLost=false; }
@@ -143,8 +226,8 @@ void registerHandlers() {
     root["domeStatus"] = domeStatusStr();
     root["safetyStatus"] = isSystemSafe() ? "SAFE" : "UNSAFE";
     root["safetySafe"] = isSystemSafe();
-    root["roofOpen"] = (digitalRead(ROOF_OPEN_PIN) == LOW);
-    root["roofClosed"] = (digitalRead(ROOF_CLOSED_PIN) == LOW);
+    root["roofOpen"] = isRoofAtOpen();
+    root["roofClosed"] = isRoofAtClosed();
     resp->setLength(); r->send(resp);
   });
  
